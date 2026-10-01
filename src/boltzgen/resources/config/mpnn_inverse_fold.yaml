@@ -1,0 +1,53 @@
+# Inverse folding backed by the MPNN family (LigandMPNN repository).
+#
+# Selected with `--inverse_fold_backend mpnn`; the default backend remains
+# BoltzIF (see inverse_fold.yaml), so existing behaviour is unchanged.
+#
+# Unlike inverse_fold.yaml this step loads no BoltzGen model: it shells out to
+# the LigandMPNN repository in its own conda environment. LigandMPNN pins
+# numpy==1.23.5 and needs ProDy, which conflict with BoltzGen's numpy==2.0.2,
+# so the two cannot share an interpreter. There is therefore no `trainer`,
+# `checkpoint` or `override` section here.
+_target_: boltzgen.task.predict.mpnn_inverse_fold.MPNNInverseFold
+
+data:
+  # Directory holding the generated backbones (<stem>.cif + <stem>.npz).
+  design_dir: null
+  # Skip designs whose output cif and npz already exist (--reuse).
+  skip_existing: false
+
+mpnn:
+  # Which MPNN variant to run. 'ligand_mpnn' is the default because it is the
+  # only variant that sees ligand and nucleic-acid context, which BoltzGen
+  # relies on when designing binders inside a holo pocket.
+  model_type: ligand_mpnn
+
+  # Absolute path to the checkpoint. Empty means "use whatever the LigandMPNN
+  # repository ships for this model_type" (its own ./model_params default).
+  checkpoint_path: ""
+
+  # Interpreter and checkout of the MPNN environment. Empty falls back to the
+  # LIGANDMPNN_PYTHONBIN / LIGANDMPNN_REPO_DIR environment variables, and then
+  # to the deployment defaults baked into mpnn_inverse_fold.py.
+  python_bin: ""
+  repo_dir: ""
+
+  # Sampling temperature. Matches BoltzIF's default so switching backends does
+  # not silently change sequence diversity.
+  temperature: 0.1
+
+  # Sequences per backbone (--inverse_fold_num_sequences).
+  num_sequences: 1
+
+  # Globally forbidden amino acids as one-letter codes, e.g. "C". X is always
+  # added on top: it maps to UNK, which lies outside the canonical token slice
+  # and so cannot be written to a designed position.
+  omit_aa: ""
+
+  # Random seed; null lets LigandMPNN pick one.
+  seed: null
+
+  # 0 keeps LigandMPNN quiet, since BoltzGen does its own progress reporting.
+  verbose: 0
+
+output: null

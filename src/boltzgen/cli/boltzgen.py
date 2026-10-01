@@ -280,6 +280,52 @@ def add_configure_arguments(
         action="store_true",
         help="Skip design step and only run inverse folding. Requires a fully specified structure.",
     )
+    p.add_argument(
+        "--inverse_fold_backend",
+        type=str,
+        choices=["boltzif", "mpnn"],
+        default="boltzif",
+        help="Which model designs sequences for the generated backbones. "
+        "'boltzif' is BoltzGen's built-in inverse folding model. 'mpnn' runs the "
+        "LigandMPNN repository instead, in its own conda environment (its "
+        "dependencies conflict with BoltzGen's). Default: %(default)s",
+    )
+    p.add_argument(
+        "--mpnn_model_type",
+        type=str,
+        choices=[
+            "ligand_mpnn",
+            "protein_mpnn",
+            "soluble_mpnn",
+            "global_label_membrane_mpnn",
+            "per_residue_label_membrane_mpnn",
+        ],
+        default="ligand_mpnn",
+        help="MPNN variant to use with '--inverse_fold_backend mpnn'. "
+        "'ligand_mpnn' keeps ligand and nucleic-acid context, which the other "
+        "variants cannot see. Default: %(default)s",
+    )
+    p.add_argument(
+        "--mpnn_checkpoint",
+        type=str,
+        default="",
+        help="Absolute path to the MPNN checkpoint. Defaults to the checkpoint "
+        "that the LigandMPNN repository ships for the selected --mpnn_model_type.",
+    )
+    p.add_argument(
+        "--mpnn_python",
+        type=str,
+        default="",
+        help="Python interpreter of the MPNN conda environment. Overrides the "
+        "LIGANDMPNN_PYTHONBIN environment variable.",
+    )
+    p.add_argument(
+        "--mpnn_repo_dir",
+        type=str,
+        default="",
+        help="Path to the LigandMPNN checkout. Overrides the "
+        "LIGANDMPNN_REPO_DIR environment variable.",
+    )
 
     # Folding and affinity prediction configuration options
     p = parser.add_argument_group("folding and affinity prediction")
@@ -1015,6 +1061,17 @@ class BinderDesignPipeline:
                     f"Inverse fold will avoid the following residues: {exclude_residues}"
                 )
             print(f"Inverse-folded designs will be saved to: {output_dir}")
+            if getattr(args, "inverse_fold_backend", "boltzif") != "boltzif":
+                # --only_inverse_fold feeds design specs straight to the model,
+                # whereas the MPNN backend consumes generated backbones
+                # (<stem>.cif + <stem>.npz) from a design directory. Fail here
+                # rather than silently running BoltzIF despite the flag.
+                raise ValueError(
+                    "--only_inverse_fold currently supports the 'boltzif' backend "
+                    "only; it inverse-folds design specs directly, while the "
+                    "'mpnn' backend reads generated backbones. Run the design "
+                    "step first and then use --steps inverse_folding."
+                )
             # Designs from inverse folding
             self.steps.append(
                 PipelineStep(
@@ -1082,26 +1139,60 @@ class BinderDesignPipeline:
                 input_dir = output_dir
                 output_dir = args.output / "intermediate_designs_inverse_folded"
                 print(f"Inverse-folded designs will be saved to: {output_dir}")
-                self.steps.append(
-                    PipelineStep(
-                        name="inverse_folding",
-                        config_path=args.config_dir / "inverse_fold.yaml",
-                        args=[
-                            f"output={output_dir}",
-                            f"data.design_dir={input_dir}",
-                            f"data.cfg.multiplicity={args.inverse_fold_num_sequences}",
-                            f"data.cfg.num_workers={args.num_workers}",
-                            f"data.skip_existing={args.reuse}",
-                            f"data.skip_existing_kind=inverse_fold",
-                            f"override.use_kernels={use_kernels}",
-                            f"checkpoint={get_artifact_path(args, args.inverse_fold_checkpoint)}",
-                            f"data.cfg.moldir={moldir}",
-                            f"trainer.devices={devices}",
-                            f"override.inverse_fold_args.inverse_fold_restriction=[{', '.join(exclude_residues)}]",
-                        ]
-                        + config_args_by_step["inverse_folding"],
+
+                # The step keeps the name "inverse_folding" for both backends:
+                # --steps filtering, protocol_configs validation and the
+                # downstream design_dir wiring all key off that name.
+                if args.inverse_fold_backend == "mpnn":
+                    # MPNN takes its forbidden residues as one-letter codes,
+                    # unlike BoltzIF which uses three-letter tokens.
+                    mpnn_step_args = [
+                        f"output={output_dir}",
+                        f"data.design_dir={input_dir}",
+                        f"data.skip_existing={args.reuse}",
+                        f"mpnn.model_type={args.mpnn_model_type}",
+                        f"mpnn.num_sequences={args.inverse_fold_num_sequences}",
+                        f"mpnn.omit_aa={inverse_fold_avoid}",
+                    ]
+                    # Only override when given, so the task's own resolution
+                    # order (config > env var > default) still applies.
+                    for key, value in (
+                        ("mpnn.checkpoint_path", args.mpnn_checkpoint),
+                        ("mpnn.python_bin", args.mpnn_python),
+                        ("mpnn.repo_dir", args.mpnn_repo_dir),
+                    ):
+                        if value:
+                            mpnn_step_args.append(f"{key}={value}")
+
+                    self.steps.append(
+                        PipelineStep(
+                            name="inverse_folding",
+                            config_path=args.config_dir / "mpnn_inverse_fold.yaml",
+                            args=mpnn_step_args
+                            + config_args_by_step["inverse_folding"],
+                        )
                     )
-                )
+                else:
+                    self.steps.append(
+                        PipelineStep(
+                            name="inverse_folding",
+                            config_path=args.config_dir / "inverse_fold.yaml",
+                            args=[
+                                f"output={output_dir}",
+                                f"data.design_dir={input_dir}",
+                                f"data.cfg.multiplicity={args.inverse_fold_num_sequences}",
+                                f"data.cfg.num_workers={args.num_workers}",
+                                f"data.skip_existing={args.reuse}",
+                                f"data.skip_existing_kind=inverse_fold",
+                                f"override.use_kernels={use_kernels}",
+                                f"checkpoint={get_artifact_path(args, args.inverse_fold_checkpoint)}",
+                                f"data.cfg.moldir={moldir}",
+                                f"trainer.devices={devices}",
+                                f"override.inverse_fold_args.inverse_fold_restriction=[{', '.join(exclude_residues)}]",
+                            ]
+                            + config_args_by_step["inverse_folding"],
+                        )
+                    )
 
         # Folding
         input_dir = output_dir
