@@ -458,6 +458,11 @@ def build_mpnn_command(
         settings.effective_omit_aa(),
         "--verbose",
         str(settings.verbose),
+        # Pin the output numbering instead of relying on run.py's default:
+        # without this it starts at _1, and a later change to that default
+        # would silently break output discovery again.
+        "--zero_indexed",
+        "1",
     ]
     if settings.seed is not None:
         cmd += ["--seed", str(settings.seed)]
@@ -498,6 +503,12 @@ def run_mpnn(cmd: Sequence[str], repo_dir: Path) -> None:
         capture_output=True,
         text=True,
     )
+    stdout = (completed.stdout or "").strip()
+    if stdout:
+        # LigandMPNN reports which residues it redesigned here; without it a
+        # run that finishes suspiciously fast gives nothing to diagnose.
+        logger.info("MPNN stdout:\n%s", stdout)
+
     if completed.returncode != 0:
         stderr = (completed.stderr or "").strip()
         hint = ""
@@ -514,6 +525,22 @@ def run_mpnn(cmd: Sequence[str], repo_dir: Path) -> None:
             f"LigandMPNN failed with exit code {completed.returncode}.\n"
             f"--- stderr ---\n{stderr}{hint}"
         )
+
+
+def find_backbone_pdb(backbones: Path, stem: str, seq_idx: int) -> Path | None:
+    """Locate the backbone PDB for one design/sequence pair.
+
+    ``run.py`` numbers its output from 1 unless ``--zero_indexed`` is set, and
+    we set it -- but accept either convention so a change to that flag's
+    default cannot silently strand the outputs again.
+    """
+    for candidate in (
+        backbones / f"{stem}_{seq_idx}.pdb",
+        backbones / f"{stem}_{seq_idx + 1}.pdb",
+    ):
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def read_designed_sequence(backbone_pdb: Path) -> dict[tuple[str, int, str], str]:
@@ -834,10 +861,13 @@ class MPNNInverseFold(Task):
             item: DesignInputs = rec["item"]
             cif_text = item.cif_path.read_text()
             for seq_idx in range(settings.num_sequences):
-                backbone_pdb = backbones / f"{item.stem}_{seq_idx}.pdb"
-                if not backbone_pdb.exists():
+                backbone_pdb = find_backbone_pdb(backbones, item.stem, seq_idx)
+                if backbone_pdb is None:
                     logger.warning(
-                        "missing MPNN output %s; skipping", backbone_pdb.name
+                        "missing MPNN output for %s sequence %d in %s; skipping",
+                        item.stem,
+                        seq_idx,
+                        backbones,
                     )
                     continue
 
@@ -862,6 +892,18 @@ class MPNNInverseFold(Task):
                 shutil.copyfile(item.npz_path, out_npz)
                 logger.debug("%s: %d residues redesigned", name, changed)
                 written += 1
+
+        if written == 0:
+            # Returning 0 quietly would let the pipeline continue on the
+            # pre-design backbones, and the failure would only surface much
+            # later as a parse error in the folding step.
+            produced = sorted(p.name for p in backbones.glob("*.pdb"))[:10]
+            raise RuntimeError(
+                f"MPNN produced no usable designs: expected "
+                f"{len(prepared)} design(s) x {settings.num_sequences} sequence(s) "
+                f"under {backbones}, but matched none. "
+                f"Files present: {produced or 'none'}."
+            )
         return written
 
     @staticmethod
