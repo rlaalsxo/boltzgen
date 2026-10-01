@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import pickle
 import shutil
 import subprocess
 import tempfile
@@ -52,11 +53,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
-import gemmi
 import numpy as np
 from omegaconf import OmegaConf
 
+from boltzgen.data import const
+from boltzgen.data.mol import load_canonicals
+from boltzgen.data.parse.mmcif import parse_mmcif
 from boltzgen.data.write.cif_to_pdb import convert_cif_to_pdb_detailed
+from boltzgen.data.write.mmcif import to_mmcif
 from boltzgen.task.predict.mpnn_alphabet import (
     MPNN_ALPHABET,
     MPNN_UNKNOWN_LETTER,
@@ -567,30 +571,88 @@ def read_designed_sequence(backbone_pdb: Path) -> dict[tuple[str, int, str], str
     return sequence
 
 
-def apply_sequence_to_cif(
-    cif_text: str,
+def apply_sequence_to_structure(
+    structure,
+    design_mask: np.ndarray,
+    designed_names: Sequence[str | None],
+) -> int:
+    """Write designed residue names into a parsed :class:`Structure`, in place.
+
+    Rewriting the parsed structure -- rather than patching the mmCIF text --
+    is what keeps the output readable. ``to_mmcif`` derives both
+    ``_atom_site.label_comp_id`` and ``_entity_poly_seq.mon_id`` from the same
+    ``residues["name"]`` field, and ``parse_polymer`` asserts those two agree.
+    Editing only the atom table leaves the sequence table describing the
+    pre-design residues, which is exactly the mismatch that assertion catches.
+
+    Args:
+        structure: a ``Structure`` from ``parse_mmcif(...).data``.
+        design_mask: per-residue flags, aligned with ``structure.residues``.
+        designed_names: 3-letter names for designable positions; ``None``
+            wherever the residue must keep its current identity.
+
+    Returns:
+        The number of residues whose name changed.
+    """
+    residues = structure.residues
+    if not (len(residues) == len(design_mask) == len(designed_names)):
+        raise ValueError(
+            f"Length mismatch: {len(residues)} residues, "
+            f"{len(design_mask)} mask entries, {len(designed_names)} names. "
+            "Refusing to rename residues that may not correspond."
+        )
+
+    changed = 0
+    for idx, (designable, new_name) in enumerate(zip(design_mask, designed_names)):
+        if not designable or not new_name:
+            continue
+        old_name = str(residues[idx]["name"])
+        if old_name == new_name:
+            continue
+        if new_name not in const.token_ids:
+            raise ValueError(
+                f"Designed residue {new_name!r} at index {idx} is not a known "
+                "BoltzGen token."
+            )
+
+        residues[idx]["name"] = new_name
+        # The tokenizer reads res_type, not name, so both must move together.
+        residues[idx]["res_type"] = const.token_ids[new_name]
+        # atom_center is CA for every amino acid, but atom_disto is CA only for
+        # glycine and CB otherwise -- so it has to follow a GLY<->non-GLY flip.
+        residues[idx]["atom_disto"] = (
+            residues[idx]["atom_idx"] + const.res_to_disto_atom_id[new_name]
+        )
+        changed += 1
+    return changed
+
+
+def rewrite_cif_with_sequence(
+    cif_path: Path,
     residue_keys: Sequence[ResidueKey],
     design_mask: np.ndarray,
     designed: dict[tuple[str, int, str], str],
+    mols: dict | None,
+    moldir: str | None,
 ) -> tuple[str, int]:
-    """Rewrite designed residue names in an mmCIF produced by BoltzGen.
+    """Re-emit a design mmCIF carrying the MPNN-designed sequence.
 
-    Only positions the design mask marks designable are touched, so fixed
-    residues keep their identity even if the MPNN output disagrees.
+    Parses with the same reader the downstream steps use, so a structure that
+    cannot be read fails here rather than several steps later.
 
     Returns:
-        The rewritten mmCIF text and the number of residues changed.
+        The mmCIF text and the number of residues changed.
 
     Raises:
-        ValueError: if a designable residue is missing from the MPNN output,
-            which would otherwise leave a stale residue silently in place.
+        ValueError: if a designable residue is absent from the MPNN output, or
+            if the parsed residues cannot be aligned with ``residue_keys``.
     """
-    designable = {
+    designable_keys = {
         (key.chain, key.number, key.icode)
         for key, flag in zip(residue_keys, design_mask)
         if flag
     }
-    missing = designable - set(designed)
+    missing = designable_keys - set(designed)
     if missing:
         sample = sorted(missing)[:5]
         raise ValueError(
@@ -598,51 +660,34 @@ def apply_sequence_to_cif(
             f"e.g. {sample}. Refusing to write a structure with stale residues."
         )
 
-    doc = gemmi.cif.read_string(cif_text)
-    block = doc.sole_block()
-    table = block.find_mmcif_category("_atom_site.")
-    columns = {tag.split(".", 1)[1]: i for i, tag in enumerate(table.tags)}
+    structure = parse_mmcif(
+        str(cif_path), mols, moldir=moldir, use_original_res_idx=False
+    ).data
 
-    def column(*candidates: str) -> int | None:
-        for name in candidates:
-            if name in columns:
-                return columns[name]
-        return None
-
-    # Prefer auth_* identifiers: those are what the PDB conversion exposed, and
-    # therefore what the MPNN output is keyed on.
-    comp_idx = column("label_comp_id", "auth_comp_id")
-    chain_idx = column("auth_asym_id", "label_asym_id")
-    seq_idx = column("auth_seq_id", "label_seq_id")
-    icode_idx = column("pdbx_PDB_ins_code")
-    if comp_idx is None or chain_idx is None or seq_idx is None:
+    # residue_keys comes from the converted PDB and lists only present
+    # residues, while the parsed structure also carries unresolved ones.
+    present_indices = [
+        i for i, res in enumerate(structure.residues) if res["is_present"]
+    ]
+    if len(present_indices) != len(residue_keys):
         raise ValueError(
-            "mmCIF _atom_site category is missing chain/residue/component "
-            "columns; cannot apply the designed sequence."
+            f"Cannot align designed sequence: the structure has "
+            f"{len(present_indices)} present residue(s) but the converted PDB "
+            f"yielded {len(residue_keys)}. Refusing to rename by position."
         )
 
-    def clean(value: str) -> str:
-        value = value.strip().strip("'\"")
-        return "" if value in (".", "?") else value
+    full_mask = np.zeros(len(structure.residues), dtype=bool)
+    names: list[str | None] = [None] * len(structure.residues)
+    for struct_idx, key, designable in zip(
+        present_indices, residue_keys, design_mask
+    ):
+        if not designable:
+            continue
+        full_mask[struct_idx] = True
+        names[struct_idx] = designed[(key.chain, key.number, key.icode)]
 
-    # _atom_site has one row per atom, so count distinct residues rather than
-    # rows -- otherwise a four-atom backbone reports four "changes".
-    changed_residues: set[tuple[str, int, str]] = set()
-    for row in table:
-        chain = clean(row[chain_idx])
-        try:
-            resnum = int(clean(row[seq_idx]))
-        except ValueError:
-            continue
-        icode = clean(row[icode_idx]) if icode_idx is not None else ""
-        identity = (chain, resnum, icode)
-        if identity not in designable:
-            continue
-        new_name = designed[identity]
-        if clean(row[comp_idx]) != new_name:
-            row[comp_idx] = new_name
-            changed_residues.add(identity)
-    return doc.as_string(), len(changed_residues)
+    changed = apply_sequence_to_structure(structure, full_mask, names)
+    return to_mmcif(structure), changed
 
 
 class MPNNInverseFold(Task):
@@ -686,6 +731,19 @@ class MPNNInverseFold(Task):
         settings = self._settings_from_config(config)
         skip_existing = bool(OmegaConf.select(config, "data.skip_existing") or False)
 
+        # Re-emitting the design mmCIF goes through BoltzGen's own parser, which
+        # needs the CCD components and any SMILES ligands the design step wrote
+        # alongside the backbones.
+        moldir = OmegaConf.select(config, "data.moldir") or OmegaConf.select(
+            config, "data.cfg.moldir"
+        )
+        mols = load_canonicals(moldir) if moldir else None
+        extra_mol_dir = design_dir / const.molecules_dirname
+        if extra_mol_dir.is_dir():
+            mols = dict(mols or {})
+            for mol_path in extra_mol_dir.glob("*.pkl"):
+                mols[mol_path.stem] = pickle.load(mol_path.open("rb"))
+
         inputs = discover_design_inputs(design_dir)
         if not inputs:
             raise RuntimeError(
@@ -723,7 +781,7 @@ class MPNNInverseFold(Task):
             run_mpnn(cmd, repo_dir)
 
             written = self._collect_outputs(
-                prepared, mpnn_out, output_dir, settings, skip_existing
+                prepared, mpnn_out, output_dir, settings, skip_existing, mols, moldir
             )
 
         logger.info("MPNN inverse folding wrote %d structures", written)
@@ -844,6 +902,8 @@ class MPNNInverseFold(Task):
         output_dir: Path,
         settings: MPNNSettings,
         skip_existing: bool,
+        mols: dict | None = None,
+        moldir: str | None = None,
     ) -> int:
         """Write the sequence-carrying cif/npz pairs the pipeline expects."""
         backbones = mpnn_out / "backbones"
@@ -859,7 +919,6 @@ class MPNNInverseFold(Task):
 
         for design_idx, rec in enumerate(prepared):
             item: DesignInputs = rec["item"]
-            cif_text = item.cif_path.read_text()
             for seq_idx in range(settings.num_sequences):
                 backbone_pdb = find_backbone_pdb(backbones, item.stem, seq_idx)
                 if backbone_pdb is None:
@@ -883,8 +942,13 @@ class MPNNInverseFold(Task):
                     continue
 
                 designed = read_designed_sequence(backbone_pdb)
-                new_cif, changed = apply_sequence_to_cif(
-                    cif_text, rec["residue_keys"], rec["design_mask"], designed
+                new_cif, changed = rewrite_cif_with_sequence(
+                    item.cif_path,
+                    rec["residue_keys"],
+                    rec["design_mask"],
+                    designed,
+                    mols,
+                    moldir,
                 )
                 out_cif.write_text(new_cif)
                 # The masks are unchanged by inverse folding, so copy them
