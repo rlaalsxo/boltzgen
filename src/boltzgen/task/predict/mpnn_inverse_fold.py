@@ -50,7 +50,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Optional, Sequence
 
 import gemmi
 import numpy as np
@@ -619,11 +619,41 @@ def apply_sequence_to_cif(
 
 
 class MPNNInverseFold(Task):
-    """Run inverse folding with an MPNN model instead of BoltzIF."""
+    """Run inverse folding with an MPNN model instead of BoltzIF.
+
+    ``main.py`` builds the task with ``hydra.utils.instantiate(config)``, which
+    passes every top-level config key as a constructor argument, and then calls
+    ``run(config)`` with the same config. The constructor therefore accepts the
+    keys declared in ``mpnn_inverse_fold.yaml``; ``**kwargs`` absorbs anything
+    an override adds so a stray key cannot break instantiation.
+    """
+
+    def __init__(
+        self,
+        data: Optional[dict] = None,
+        mpnn: Optional[dict] = None,
+        output: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        self.data = data or {}
+        self.mpnn = mpnn or {}
+        self.output = output
+        if kwargs:
+            logger.debug("ignoring unused config keys: %s", sorted(kwargs))
 
     def run(self, config: OmegaConf) -> None:  # noqa: D102 - see module docstring
-        design_dir = Path(config.data.design_dir)
-        output_dir = Path(config.output)
+        design_dir_value = OmegaConf.select(config, "data.design_dir")
+        if not design_dir_value:
+            raise ValueError(
+                "data.design_dir is not set; the MPNN inverse folding step needs "
+                "the directory holding the generated backbones."
+            )
+        output_value = OmegaConf.select(config, "output")
+        if not output_value:
+            raise ValueError("output is not set for the MPNN inverse folding step.")
+
+        design_dir = Path(design_dir_value)
+        output_dir = Path(output_value)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         settings = self._settings_from_config(config)
