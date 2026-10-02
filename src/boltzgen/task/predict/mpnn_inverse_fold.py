@@ -737,7 +737,15 @@ class MPNNInverseFold(Task):
         moldir = OmegaConf.select(config, "data.moldir") or OmegaConf.select(
             config, "data.cfg.moldir"
         )
-        mols = load_canonicals(moldir) if moldir else None
+        if not moldir:
+            # Without it the parser reaches load_molecules(None, ...) and dies
+            # on Path(None), several frames away from the actual cause.
+            raise ValueError(
+                "moldir is not set for the MPNN inverse folding step. Rewriting "
+                "the design mmCIF parses it with BoltzGen's reader, which needs "
+                "the CCD components; pass 'data.cfg.moldir=<path>'."
+            )
+        mols = load_canonicals(moldir)
         extra_mol_dir = design_dir / const.molecules_dirname
         if extra_mol_dir.is_dir():
             mols = dict(mols or {})

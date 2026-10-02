@@ -1150,6 +1150,9 @@ class BinderDesignPipeline:
                         f"output={output_dir}",
                         f"data.design_dir={input_dir}",
                         f"data.skip_existing={args.reuse}",
+                        # Re-emitting the design mmCIF parses it with BoltzGen's
+                        # own reader, which needs the CCD components.
+                        f"data.cfg.moldir={moldir}",
                         f"mpnn.model_type={args.mpnn_model_type}",
                         f"mpnn.num_sequences={args.inverse_fold_num_sequences}",
                         f"mpnn.omit_aa={inverse_fold_avoid}",
